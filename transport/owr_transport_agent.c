@@ -1996,9 +1996,8 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
     GValueArray *sources = NULL;
     GObject *source = NULL;
     guint session_id = 0;
-
     OWR_UNUSED(early);
-
+    
     if (gst_rtcp_buffer_map(buffer, GST_MAP_READ, &rtcp_buffer)) {
         has_packet = gst_rtcp_buffer_get_first_packet(&rtcp_buffer, &rtcp_packet);
         for (; has_packet; has_packet = gst_rtcp_packet_move_to_next(&rtcp_packet)) {
@@ -2007,6 +2006,7 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
                 do_not_suppress = TRUE;
                 break;
             }
+          
         }
         gst_rtcp_buffer_unmap(&rtcp_buffer);
     }
@@ -2070,8 +2070,13 @@ static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_sour
     GstStructure *stats;
     GHashTable *stats_hash;
     GValue *value;
+    guint j=0;
+    guint32 *exthighestseq = 0, *exthighestseq_old=0;
+    GstElement *rtpbin=NULL;
 
     g_object_get(rtp_source, "stats", &stats, NULL);
+           
+       
     stats_hash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, value_slice_free);
     value = g_slice_new0(GValue);
     value = g_value_init(value, G_TYPE_STRING);
@@ -2079,6 +2084,18 @@ static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_sour
     g_hash_table_insert(stats_hash, g_strdup("type"), value);
     gst_structure_foreach(stats,
         (GstStructureForeachFunc)update_stats_hash_table, stats_hash);
+     
+    
+
+   exthighestseq=g_hash_table_lookup (stats_hash,&"rb-exthighestseq");
+     if(exthighestseq == exthighestseq_old){
+         exthighestseq_old = exthighestseq;
+              j++; 
+            }
+         if(j>=3){
+          gst_element_set_state(rtpbin, GST_STATE_PAUSED);
+               }  
+ 
     gst_structure_free(stats);
 
     value = g_slice_new0(GValue);
