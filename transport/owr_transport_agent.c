@@ -2196,7 +2196,7 @@ congestion circuit breaker is triggered. */
 
       }
     
-      printf("%f %d",transmit_rate,bitrate);
+      //printf("%f %d",transmit_rate,bitrate);
      
     }
 g_object_unref(priva);
