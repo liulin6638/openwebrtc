@@ -1999,6 +1999,7 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
     GObject *source = NULL;
     guint session_id = 0;
     OWR_UNUSED(early);
+   // guint rtcp_report_count =0;
     
     if (gst_rtcp_buffer_map(buffer, GST_MAP_READ, &rtcp_buffer)) {
         has_packet = gst_rtcp_buffer_get_first_packet(&rtcp_buffer, &rtcp_packet);
@@ -2008,6 +2009,9 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
                 do_not_suppress = TRUE;
                 break;
             }
+            //if (packet_type == GST_RTCP_TYPE_SR || packet_type == GST_RTCP_TYPE_RR) {
+              // rtcp_report_count++ ;
+             //}
           
         }
         gst_rtcp_buffer_unmap(&rtcp_buffer);
@@ -2082,7 +2086,7 @@ static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_sour
     g_hash_table_insert(stats_hash, g_strdup("type"), value);
     gst_structure_foreach(stats,
         (GstStructureForeachFunc)update_stats_hash_table, stats_hash);
-    circuitbreaker1(stats_hash,media_session,rtp_source);    
+    circuitbreakers(stats_hash,media_session,rtp_source);    
  
     gst_structure_free(stats);
 
@@ -2133,19 +2137,21 @@ gchar * owr_transport_agent_get_dot_data(OwrTransportAgent *transport_agent)
     return gst_debug_bin_to_dot_data(GST_BIN(transport_agent->priv->pipeline), GST_DEBUG_GRAPH_SHOW_ALL);
 }
 
-static void circuitbreaker1(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source){
+static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source){
 
     guint j=0, b=1;
     guint32 *exthighestseq = 0, *exthighestseq_old=0;
     guint *fractionlost, *round_triptime, *packet_size;
-    gboolean *rtpsender_flag;
-    uint *sequence_number = NULL;
-    uint *old_sequence_number = NULL;
+    gboolean *rtpsender_flag, *rtcp_sr, *rtcp_rr;
+    //uint *sequence_number = NULL;
+   // uint *old_sequence_number = NULL;
     gdouble transmit_rate = 0;
     OwrPayload *priva;
     guint bitrate;
     guint byterate;
-   // GstElement *rtpbin;
+    guint64 *packets_sent = 0;
+    guint64 *old_packets_sent = 0;
+   //GstElement *rtpbin;
 
 /*RTP/AVP Circuit Breaker #1: Media Timeout: 
 If RTP data packets are being sent, but the RTCP SR or RR packets reporting on that SSRC indicate a non-increasing extended highest
@@ -2154,27 +2160,33 @@ sequence number received, this is an indication that those RTP data packets are 
 
 //gst_rtp_buffer_get_seq ()
      rtpsender_flag= g_hash_table_lookup (stats_hash,&"is-sender");
-     sequence_number=g_hash_table_lookup (stats_hash,&"seqnum-base");
+     //sequence_number=g_hash_table_lookup (stats_hash,&"seqnum-base");
      exthighestseq=g_hash_table_lookup (stats_hash,&"rb-exthighestseq");
      fractionlost=g_hash_table_lookup (stats_hash,&"rb-fractionlost");
      round_triptime = g_hash_table_lookup (stats_hash,&"rb-round-trip");
      packet_size = g_hash_table_lookup (stats_hash,&"sr-octet-count");
+     rtcp_sr = g_hash_table_lookup (stats_hash,&"have-sr");
+     rtcp_rr = g_hash_table_lookup (stats_hash,&"have-rb");
+     packets_sent= g_hash_table_lookup (stats_hash,&"packets-sent");
 
-    if((*rtpsender_flag)&&(*sequence_number != *old_sequence_number))
-      {
+    //if((*rtpsender_flag)&&(*sequence_number != *old_sequence_number))
+ 
+      if( (rtpsender_flag) && ((*packets_sent) >0 ) && ((*packets_sent) != (*old_packets_sent)))
+         {
      if(((*exthighestseq) == (*exthighestseq_old)) && (*fractionlost)==0 && (*exthighestseq) >0 && (*exthighestseq_old) >0){
          *exthighestseq_old = *exthighestseq;
               j++; 
             }
-         if(j>=3){
-           //OwrMediaSource *media_source = _owr_media_session_get_send_source(media_session);
-           //remove_existing_send_source_and_payload(transport_agent, media_source, media_session);
-           //gst_element_set_state(rtpbin, GST_STATE_NULL);
+         if((j>=3) || ((rtcp_sr) || (rtcp_rr)) ) 
+               {
+            //gst_element_set_state(rtpbin, GST_STATE_NULL);
            owr_transport_agent_finalize(rtp_source);
+     //interval = rtp_session_get_reporting_interval (rtpsession->priv->session);
+
+
                }  
-       *old_sequence_number = *sequence_number;
-      }
-  
+       //*old_sequence_number = *sequence_number;          
+      
 /* RTP/AVP Circuit Breaker #3: Congestion:
 If RTP data packets are being sent, and the corresponding RTCP SR or RR packets show non-zero packet loss fraction and increasing extended
 highest sequence number received, then those RTP data packets are arriving at the receiver, but some degree of congestion is occurring. If the
@@ -2183,7 +2195,7 @@ that would be achieved over the path using the chosen TCP throughput equation an
 event rate, p (as approximated by the fraction lost), and the packet size, s.  Compare this with the actual sending rate.  If the actual
 sending rate has been more than ten times the TCP throughput estimate for three (or more) consecutive RTCP reporting intervals, then the
 congestion circuit breaker is triggered. */
-    if( *fractionlost > 0 && (*sequence_number > *old_sequence_number)){
+    if( (*fractionlost > 0) && ((*exthighestseq) > (*exthighestseq_old)) && (*exthighestseq) >0 && (*exthighestseq_old) >0){
      
       transmit_rate = (*packet_size)/((*round_triptime) * (sqrt(2*b*((*fractionlost)/3)))); 
       priva = _owr_media_session_get_send_payload(media_session);
@@ -2197,7 +2209,8 @@ congestion circuit breaker is triggered. */
       }
     
       //printf("%f %d",transmit_rate,bitrate);
-     
+     }
+  *old_packets_sent  = *packets_sent ;
     }
 g_object_unref(priva);
 
