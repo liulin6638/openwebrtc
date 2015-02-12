@@ -141,7 +141,7 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
 static void on_ssrc_active(GstElement *rtpbin, guint session_id, guint ssrc, OwrTransportAgent *transport_agent);
 static void on_new_jitterbuffer(GstElement *rtpbin, GstElement *jitterbuffer, guint session_id, guint ssrc, OwrTransportAgent *transport_agent);
 static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_source);
-static void circuitbreaker1(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source);
+static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source);
 
 
 static void owr_transport_agent_finalize(GObject *object)
@@ -2143,22 +2143,19 @@ static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_sessio
     guint32 *exthighestseq = 0, *exthighestseq_old=0;
     guint *fractionlost, *round_triptime, *packet_size;
     gboolean *rtpsender_flag, *rtcp_sr, *rtcp_rr;
-    //uint *sequence_number = NULL;
-   // uint *old_sequence_number = NULL;
     gdouble transmit_rate = 0;
     OwrPayload *priva;
     guint bitrate;
     guint byterate;
     guint64 *packets_sent = 0;
     guint64 *old_packets_sent = 0;
-   //GstElement *rtpbin;
+   
 
 /*RTP/AVP Circuit Breaker #1: Media Timeout: 
 If RTP data packets are being sent, but the RTCP SR or RR packets reporting on that SSRC indicate a non-increasing extended highest
 sequence number received, this is an indication that those RTP data packets are not reaching the receiver.  Accordingly, if a sender of RTP data packets receives three or more consecutive RTCP SR or RR packets from the same receiver, and those packets correspond to its transmission and have a non-increasing extended highest sequence number received field, then that sender SHOULD cease transmission. The extended highest sequence number received field is non-increasing if the sender receives at least three consecutive RTCP SR or RR packets that report the same value for this field, but it has sent RTP data packets that would have caused an increase in the reported value if they had reached the receiver.*/
 
 
-//gst_rtp_buffer_get_seq ()
      rtpsender_flag= g_hash_table_lookup (stats_hash,&"is-sender");
      //sequence_number=g_hash_table_lookup (stats_hash,&"seqnum-base");
      exthighestseq=g_hash_table_lookup (stats_hash,&"rb-exthighestseq");
@@ -2171,21 +2168,20 @@ sequence number received, this is an indication that those RTP data packets are 
 
     //if((*rtpsender_flag)&&(*sequence_number != *old_sequence_number))
  
-      if( (rtpsender_flag) && ((*packets_sent) >0 ) && ((*packets_sent) != (*old_packets_sent)))
-         {
-     if(((*exthighestseq) == (*exthighestseq_old)) && (*fractionlost)==0 && (*exthighestseq) >0 && (*exthighestseq_old) >0){
-         *exthighestseq_old = *exthighestseq;
-              j++; 
-            }
-         if((j>=3) || ((rtcp_sr) || (rtcp_rr)) ) 
-               {
-            //gst_element_set_state(rtpbin, GST_STATE_NULL);
-           owr_transport_agent_finalize(rtp_source);
-     //interval = rtp_session_get_reporting_interval (rtpsession->priv->session);
-
-
-               }  
-       //*old_sequence_number = *sequence_number;          
+     if( (rtpsender_flag) && ((*packets_sent) >0 ) && ((*packets_sent) != (*old_packets_sent)))
+           {
+            if(((*exthighestseq) == (*exthighestseq_old)) && (*fractionlost)==0 && (*exthighestseq) >0 && (*exthighestseq_old) >0)
+                          {
+                       *exthighestseq_old = *exthighestseq;
+                          j++; 
+                           }
+             if((j>=3) || (!((rtcp_sr) || (rtcp_rr))) ) 
+                          {
+                             //gst_element_set_state(rtpbin, GST_STATE_NULL);
+                          owr_transport_agent_finalize(rtp_source);
+                             //interval = rtp_session_get_reporting_interval (rtpsession->priv->session);
+                           }  
+                                 //*old_sequence_number = *sequence_number;          
       
 /* RTP/AVP Circuit Breaker #3: Congestion:
 If RTP data packets are being sent, and the corresponding RTCP SR or RR packets show non-zero packet loss fraction and increasing extended
@@ -2195,23 +2191,21 @@ that would be achieved over the path using the chosen TCP throughput equation an
 event rate, p (as approximated by the fraction lost), and the packet size, s.  Compare this with the actual sending rate.  If the actual
 sending rate has been more than ten times the TCP throughput estimate for three (or more) consecutive RTCP reporting intervals, then the
 congestion circuit breaker is triggered. */
-    if( (*fractionlost > 0) && ((*exthighestseq) > (*exthighestseq_old)) && (*exthighestseq) >0 && (*exthighestseq_old) >0){
-     
-      transmit_rate = (*packet_size)/((*round_triptime) * (sqrt(2*b*((*fractionlost)/3)))); 
-      priva = _owr_media_session_get_send_payload(media_session);
-      g_object_get(priva, "bitrate", &bitrate, NULL);
-      byterate = (bitrate)/8 ;
+             if( (*fractionlost > 0) && ((*exthighestseq) > (*exthighestseq_old)) && (*exthighestseq) >0 && (*exthighestseq_old) >0)
+                         {
+                        transmit_rate = (*packet_size)/((*round_triptime) * (sqrt(2*b*((*fractionlost)/3)))); 
+                        priva = _owr_media_session_get_send_payload(media_session);
+                        g_object_get(priva, "bitrate", &bitrate, NULL);
+                        byterate = (bitrate)/8 ;
     
-      if(byterate > (10*transmit_rate)){
-      owr_transport_agent_finalize(rtp_source);
-      //gst_element_set_state(rtpbin, GST_STATE_NULL);
-
-      }
-    
-      //printf("%f %d",transmit_rate,bitrate);
-     }
-  *old_packets_sent  = *packets_sent ;
-    }
-g_object_unref(priva);
+                                if(byterate > (10*transmit_rate))
+                                    {
+                                   owr_transport_agent_finalize(rtp_source);
+                                   //gst_element_set_state(rtpbin, GST_STATE_NULL);
+                                    }
+                         }
+    *old_packets_sent  = *packets_sent ;
+           }
+    g_object_unref(priva);
 
 }
