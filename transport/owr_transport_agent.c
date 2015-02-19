@@ -140,9 +140,9 @@ static GstElement * on_rtpbin_request_aux_receiver(GstElement *rtpbin, guint ses
 static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean early, OwrTransportAgent *agent);
 static void on_ssrc_active(GstElement *rtpbin, guint session_id, guint ssrc, OwrTransportAgent *transport_agent);
 static void on_new_jitterbuffer(GstElement *rtpbin, GstElement *jitterbuffer, guint session_id, guint ssrc, OwrTransportAgent *transport_agent);
-static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_source);
-static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source);
-
+static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_source,OwrTransportAgent *agent,GObject *rtp_session);
+static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,OwrTransportAgent *transport_agent,GObject *rtp_session);
+GstClockTime deterministic_rtcp_interval(GObject *rtp_session, gboolean we_send, gboolean first);
 
 static void owr_transport_agent_finalize(GObject *object)
 {
@@ -2030,7 +2030,7 @@ static gboolean on_sending_rtcp(GObject *session, GstBuffer *buffer, gboolean ea
 
     g_object_get(session, "sources", &sources, NULL);
     source = g_value_get_object(g_value_array_get_nth(sources, 0));
-    prepare_rtcp_stats(media_session, source);
+    prepare_rtcp_stats(media_session, source,agent,session);
     g_value_array_free(sources);
     g_object_unref(media_session);
 
@@ -2071,7 +2071,7 @@ static gboolean emit_stats_signal(GHashTable *stats_hash)
     return FALSE;
 }
 
-static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_source)
+static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_source,OwrTransportAgent *agent,GObject *rtp_session)
 {
     GstStructure *stats;
     GHashTable *stats_hash;
@@ -2086,7 +2086,7 @@ static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_sour
     g_hash_table_insert(stats_hash, g_strdup("type"), value);
     gst_structure_foreach(stats,
         (GstStructureForeachFunc)update_stats_hash_table, stats_hash);
-    circuitbreakers(stats_hash,media_session,rtp_source);    
+       circuitbreakers(stats_hash,media_session, agent, rtp_session); 
  
     gst_structure_free(stats);
 
@@ -2094,7 +2094,7 @@ static void prepare_rtcp_stats(OwrMediaSession *media_session, GObject *rtp_sour
     value = g_value_init(value, OWR_TYPE_MEDIA_SESSION);
     g_value_set_object(value, media_session);
     g_hash_table_insert(stats_hash,  g_strdup("media_session"), value);
-
+    
     _owr_schedule_with_hash_table((GSourceFunc)emit_stats_signal, stats_hash);
 }
 
@@ -2103,14 +2103,13 @@ static void on_ssrc_active(GstElement *rtpbin, guint session_id, guint ssrc,
 {
     OwrMediaSession *media_session;
     GObject *rtp_session, *rtp_source;
-
+    
     g_return_if_fail(OWR_IS_TRANSPORT_AGENT(transport_agent));
     media_session = get_media_session(transport_agent, session_id);
     g_return_if_fail(OWR_IS_MEDIA_SESSION(media_session));
-
     g_signal_emit_by_name(rtpbin, "get-internal-session", session_id, &rtp_session);
     g_signal_emit_by_name(rtp_session, "get-source-by-ssrc", ssrc, &rtp_source);
-    prepare_rtcp_stats(media_session, rtp_source);
+    prepare_rtcp_stats(media_session, rtp_source, transport_agent,rtp_session);
     g_object_unref(rtp_source);
     g_object_unref(rtp_session);
     g_object_unref(media_session);
@@ -2137,7 +2136,16 @@ gchar * owr_transport_agent_get_dot_data(OwrTransportAgent *transport_agent)
     return gst_debug_bin_to_dot_data(GST_BIN(transport_agent->priv->pipeline), GST_DEBUG_GRAPH_SHOW_ALL);
 }
 
-static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,GObject *rtp_source){
+/*
+Circuit Breaker #1: Media Timeout (If a sender of RTP data packets receives three or more consecutive RTCP SR or RR packets from the same receiver, and those packets correspond to its transmission and have a non-increasing extended highest sequence number received field, then that sender SHOULD cease transmission.)
+ 
+Circuit Breaker #2: RTCP Timeout (An RTP sender that has not received any RTCP SR or RTCP RR packets reporting on the SSRC it is using for three or more of its RTCP reporting intervals SHOULD cease transmission.)
+
+Circuit Breaker #3: Congestion ( If RTP data packets are being sent, and the corresponding RTCP SR or RR packets show non-zero packet loss fraction and increasing extended highest sequence number received, then those RTP data packets are arriving at the receiver, but some degree of congestion is occurring.If the fraction lost field is zero, then continue sending as normal. If the fraction lost is greater than zero, then estimate the TCP throughput that would be achieved over the path using the chosen TCP throughput equation and the measured values of the round-trip time, R, the loss event rate, p (as approximated by the fraction lost), and the packet size, s.  Compare this with the actual sending rate.  If the actual sending rate has been more than ten times the TCP throughput estimate for three (or more) consecutive RTCP reporting intervals, then the congestion circuit breaker is triggered.
+
+*/
+
+static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_session,OwrTransportAgent *transport_agent,GObject *rtp_session){
 
     guint j=0, b=1;
     guint32 *exthighestseq = 0, *exthighestseq_old=0;
@@ -2149,15 +2157,14 @@ static void circuitbreakers(GHashTable *stats_hash,OwrMediaSession *media_sessio
     guint byterate;
     guint64 *packets_sent = 0;
     guint64 *old_packets_sent = 0;
-   
-
-/*RTP/AVP Circuit Breaker #1: Media Timeout: 
-If RTP data packets are being sent, but the RTCP SR or RR packets reporting on that SSRC indicate a non-increasing extended highest
-sequence number received, this is an indication that those RTP data packets are not reaching the receiver.  Accordingly, if a sender of RTP data packets receives three or more consecutive RTCP SR or RR packets from the same receiver, and those packets correspond to its transmission and have a non-increasing extended highest sequence number received field, then that sender SHOULD cease transmission. The extended highest sequence number received field is non-increasing if the sender receives at least three consecutive RTCP SR or RR packets that report the same value for this field, but it has sent RTP data packets that would have caused an increase in the reported value if they had reached the receiver.*/
-
+    GstClockTime interval,deterministic_interval;
+    GstStructure *sess;
+    GstClockTime current_time;
+    GstClockTime  start_time;
+    GstClock *sysclock;
+    gboolean  first_rtcp;
 
      rtpsender_flag= g_hash_table_lookup (stats_hash,&"is-sender");
-     //sequence_number=g_hash_table_lookup (stats_hash,&"seqnum-base");
      exthighestseq=g_hash_table_lookup (stats_hash,&"rb-exthighestseq");
      fractionlost=g_hash_table_lookup (stats_hash,&"rb-fractionlost");
      round_triptime = g_hash_table_lookup (stats_hash,&"rb-round-trip");
@@ -2166,31 +2173,27 @@ sequence number received, this is an indication that those RTP data packets are 
      rtcp_rr = g_hash_table_lookup (stats_hash,&"have-rb");
      packets_sent= g_hash_table_lookup (stats_hash,&"packets-sent");
 
-    //if((*rtpsender_flag)&&(*sequence_number != *old_sequence_number))
- 
-     if( (rtpsender_flag) && ((*packets_sent) >0 ) && ((*packets_sent) != (*old_packets_sent)))
+     g_object_get(rtp_session, "internal-session", &sess, NULL);
+     gst_structure_get_clock_time (sess, "start_time", &start_time);
+     gst_structure_get_boolean (sess, "first_rtcp", &first_rtcp);
+
+     if( (*rtpsender_flag) && ((*packets_sent) >0 ) && ((*packets_sent) != (*old_packets_sent)))
            {
             if(((*exthighestseq) == (*exthighestseq_old)) && (*fractionlost)==0 && (*exthighestseq) >0 && (*exthighestseq_old) >0)
                           {
                        *exthighestseq_old = *exthighestseq;
                           j++; 
                            }
-             if((j>=3) || (!((rtcp_sr) || (rtcp_rr))) ) 
+             sysclock = GST_ELEMENT_CLOCK (rtp_session);
+             current_time = gst_clock_get_time (sysclock);
+             deterministic_interval = deterministic_rtcp_interval(rtp_session, TRUE, first_rtcp);
+             interval = MAX (deterministic_interval * 3, 5 * GST_SECOND);
+            
+             if((j>=3) || ((!((rtcp_sr) || (rtcp_rr))) && ((current_time - start_time) > interval))) 
                           {
-                             //gst_element_set_state(rtpbin, GST_STATE_NULL);
-                          owr_transport_agent_finalize(rtp_source);
-                             //interval = rtp_session_get_reporting_interval (rtpsession->priv->session);
-                           }  
-                                 //*old_sequence_number = *sequence_number;          
-      
-/* RTP/AVP Circuit Breaker #3: Congestion:
-If RTP data packets are being sent, and the corresponding RTCP SR or RR packets show non-zero packet loss fraction and increasing extended
-highest sequence number received, then those RTP data packets are arriving at the receiver, but some degree of congestion is occurring. If the
-fraction lost field is zero, then continue sending as normal.  If the fraction lost is greater than zero, then estimate the TCP throughput
-that would be achieved over the path using the chosen TCP throughput equation and the measured values of the round-trip time, R, the loss
-event rate, p (as approximated by the fraction lost), and the packet size, s.  Compare this with the actual sending rate.  If the actual
-sending rate has been more than ten times the TCP throughput estimate for three (or more) consecutive RTCP reporting intervals, then the
-congestion circuit breaker is triggered. */
+                           gst_element_set_state(transport_agent->priv->pipeline, GST_STATE_NULL);
+                          }  
+ 
              if( (*fractionlost > 0) && ((*exthighestseq) > (*exthighestseq_old)) && (*exthighestseq) >0 && (*exthighestseq_old) >0)
                          {
                         transmit_rate = (*packet_size)/((*round_triptime) * (sqrt(2*b*((*fractionlost)/3)))); 
@@ -2200,12 +2203,70 @@ congestion circuit breaker is triggered. */
     
                                 if(byterate > (10*transmit_rate))
                                     {
-                                   owr_transport_agent_finalize(rtp_source);
-                                   //gst_element_set_state(rtpbin, GST_STATE_NULL);
+                                   gst_element_set_state(transport_agent->priv->pipeline, GST_STATE_PLAYING);
                                     }
                          }
     *old_packets_sent  = *packets_sent ;
            }
     g_object_unref(priva);
-
+    g_object_unref(rtp_session);
 }
+
+
+GstClockTime deterministic_rtcp_interval(GObject *rtp_session, gboolean we_send, gboolean first){
+
+   gdouble members, n; 
+   gdouble avg_rtcp_size, rtcp_bw;
+   gdouble interval;
+   GstStructure *stats = NULL;
+   gdouble const RTCP_MIN_TIME = 5;
+   gdouble const RTCP_SENDER_BW_FRACTION = 0.25;
+   gdouble const RTCP_RCVR_BW_FRACTION = (1-RTCP_SENDER_BW_FRACTION);
+   gdouble const COMPENSATION = 2.71828 - 1.5;
+   guint active_sources;
+   guint senders;
+   gdouble rtcp_min_time = RTCP_MIN_TIME;
+
+
+    g_object_get(rtp_session, "stats", &stats, NULL);
+    g_object_get(rtp_session, "num-active-sources", &active_sources, NULL);
+    gst_structure_get_uint (stats, "sender_sources", &senders);
+    gst_structure_get_double(stats, "rtcp_bandwidth", &rtcp_bw);
+    gst_structure_get_double(stats, "avg_rtcp_packet_size", &avg_rtcp_size);
+   
+    if (first) 
+         {
+        rtcp_min_time /= 2.0;
+         }
+    n = members = active_sources;
+ 
+    if (senders <= members * RTCP_SENDER_BW_FRACTION)
+         {
+       if (we_send) {
+           rtcp_bw *= RTCP_SENDER_BW_FRACTION;
+                  n = senders;
+                   } 
+                  else {
+                    rtcp_bw *= RTCP_RCVR_BW_FRACTION;
+                    n -= senders;
+                       }
+         }
+
+    if (rtcp_bw <= 0.00001)
+      {
+    return GST_CLOCK_TIME_NONE;
+      }
+  
+   GST_DEBUG ("avg size %f, n %f, rtcp_bw %f", avg_rtcp_size, n, rtcp_bw);
+   interval = avg_rtcp_size * n / rtcp_bw;
+    if (interval < rtcp_min_time)
+      {
+      interval = rtcp_min_time;
+      }
+  interval = (interval * g_random_double_range (0.5, 1.5)) / COMPENSATION;
+  g_object_unref(rtp_session);
+  return interval * GST_SECOND;
+  
+}
+
+
