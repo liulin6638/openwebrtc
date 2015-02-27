@@ -181,6 +181,7 @@ static void owr_media_session_on_new_stats(OwrMediaSession *media_session, GHash
 {
     g_warn_if_fail(media_session);
     g_warn_if_fail(stats);
+    
 }
 
 static void owr_media_session_finalize(GObject *object)
