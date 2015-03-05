@@ -2133,26 +2133,26 @@ gchar * owr_transport_agent_get_dot_data(OwrTransportAgent *transport_agent)
 static void circuitbreakers(GHashTable *stats_hash,OwrTransportAgent *transport_agent,OwrMediaSession *media_session)
 {
     guint j=0, b=1;
-    guint32 *exthighestseq = 0;
-    guint32 *exthighestseq_old=0;
-    guint *fractionlost =0, *round_triptime =0, *packet_size = 0;
+    guint32 exthighestseq = 0;
+    guint32 exthighestseq_old=0;
+    guint fractionlost =0, round_triptime =0, packet_size = 0;
     gboolean *rtpsender_flag = NULL, *rtcp_sr = NULL, *rtcp_rr = NULL;
     gdouble transmit_rate = 0;
     OwrPayload *priva;
     guint bitrate =0;
     guint byterate =0;
-    guint64 *packets_sent = 0;
-    guint64 *old_packets_sent = 0;
+    guint64 packets_sent = 0;
+    guint64 old_packets_sent = 0;
     
     rtpsender_flag= g_hash_table_lookup (stats_hash,"is-sender");
-    exthighestseq=g_hash_table_lookup (stats_hash,"rb-exthighestseq");
-    fractionlost=g_hash_table_lookup (stats_hash,"rb-fractionlost");
-    round_triptime = g_hash_table_lookup (stats_hash,"rb-round-trip");
-    packet_size = g_hash_table_lookup (stats_hash,"sr-octet-count");
+    exthighestseq= GPOINTER_TO_UINT(g_hash_table_lookup (stats_hash,"rb-exthighestseq"));
+    fractionlost= GPOINTER_TO_UINT(g_hash_table_lookup (stats_hash,"rb-fractionlost"));
+    round_triptime = GPOINTER_TO_UINT(g_hash_table_lookup (stats_hash,"rb-round-trip"));
+    packet_size = GPOINTER_TO_UINT(g_hash_table_lookup (stats_hash,"sr-octet-count"));
     rtcp_sr = g_hash_table_lookup (stats_hash,"have-sr");
     rtcp_rr = g_hash_table_lookup (stats_hash,"have-rb");
-    packets_sent= g_hash_table_lookup (stats_hash,"packets-sent");
-
+    packets_sent= GPOINTER_TO_UINT(g_hash_table_lookup (stats_hash,"packets-sent"));
+    
     if( (rtpsender_flag) && ((packets_sent) >0 ) && ((packets_sent) != (old_packets_sent)))
     {
         if(((exthighestseq) == (exthighestseq_old)) && (fractionlost)==0 && (exthighestseq) >0 && (exthighestseq_old) >0)
@@ -2166,14 +2166,14 @@ static void circuitbreakers(GHashTable *stats_hash,OwrTransportAgent *transport_
         }
         if( (fractionlost > 0) && ((exthighestseq) > (exthighestseq_old)) && (exthighestseq) >0 && (exthighestseq_old) >0)
         {
-            transmit_rate = (float)(*packet_size)/((*round_triptime) * sqrt(2*b*((*fractionlost)/3)));
+            transmit_rate = (float)(packet_size/((round_triptime) * sqrt(2*b*((fractionlost)/3))));
             priva = _owr_media_session_get_send_payload(media_session);
             g_object_get(priva, "bitrate", &bitrate, NULL);
             byterate = (bitrate)/8 ;
             
             if(byterate > (10*transmit_rate))
             {
-                gst_element_set_state(transport_agent->priv->pipeline, GST_STATE_PLAYING);
+                gst_element_set_state(transport_agent->priv->pipeline, GST_STATE_NULL);
             }
             g_object_unref(priva);
         }
@@ -2181,4 +2181,3 @@ static void circuitbreakers(GHashTable *stats_hash,OwrTransportAgent *transport_
     old_packets_sent  = packets_sent ;
     
 }
-
